@@ -1,11 +1,6 @@
-import { useState, useEffect } from 'react';
-import {
-  Play, CheckCircle, AlertCircle, TrendingUp,
-  BookOpen, ChevronRight, Info, Star,
-} from 'lucide-react';
+import { useState, useEffect, useCallback } from 'react';
+import { Play, CheckCircle, AlertCircle, TrendingUp, Trophy, LogIn } from 'lucide-react';
 import { supabase } from '../lib/supabase';
-
-// ── Types ─────────────────────────────────────────────────────────────────────
 
 interface ExperimentRun {
   id: string;
@@ -14,10 +9,6 @@ interface ExperimentRun {
   config: string;
   epochs: number;
   batch_size: number;
-  changed_from?: string;
-  change_note?: string;
-  change_variable?: string;
-  rvc_commit?: string;
   status: 'pending' | 'running' | 'complete' | 'failed';
   scores?: Record<string, number>;
   created_at: string;
@@ -34,809 +25,476 @@ interface Decision {
   created_at: string;
 }
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-const DATASETS = ['clean', 'natural', 'raw'] as const;
-const CONFIGS  = ['baseline', 'high_quality'] as const;
-
-const DATASET_COLORS: Record<string, string> = {
-  clean:   'bg-sky-100 text-sky-800 border-sky-300',
-  natural: 'bg-emerald-100 text-emerald-800 border-emerald-300',
-  raw:     'bg-amber-100 text-amber-800 border-amber-300',
-};
-
-// ── Helper functions ──────────────────────────────────────────────────────────
-
-function getCompositeScore(scores?: Record<string, number>): number | null {
-  if (!scores) return null;
-  // Weights: naturalness 0.35 + clarity 0.30 + identity (pitch_corr) 0.35
-  // identity = pitch correlation — the real voice identity metric
-  return (
-    (scores.naturalness || 0) * 0.35 +
-    (scores.clarity     || 0) * 0.30 +
-    (scores.identity    || 0) * 0.35
-  );
-}
-
-function getStatusBadge(status: string): string {
-  switch (status) {
-    case 'complete': return 'bg-green-100 text-green-800 border-green-300';
-    case 'running':  return 'bg-blue-100 text-blue-800 border-blue-300';
-    case 'failed':   return 'bg-red-100 text-red-800 border-red-300';
-    default:         return 'bg-gray-100 text-gray-700 border-gray-300';
-  }
-}
-
-function nextExpId(runs: ExperimentRun[]): string {
-  if (runs.length === 0) return 'exp_001';
-  const nums = runs
-    .map(r => parseInt(r.exp_id.split('_')[1] || '0'))
-    .filter(n => !isNaN(n));
-  const max = Math.max(0, ...nums);
-  return `exp_${String(max + 1).padStart(3, '0')}`;
-}
-
-// ── Dataset Coverage widget ───────────────────────────────────────────────────
-
-function DatasetCoverage({ runs }: { runs: ExperimentRun[] }) {
-  const completed = runs.filter(r => r.status === 'complete');
-  const covered   = new Set(completed.map(r => r.dataset));
-
-  return (
-    <div className="bg-white rounded-lg border border-slate-200 p-5 mb-6">
-      <h2 className="text-sm font-semibold text-slate-700 uppercase tracking-wider mb-3">
-        Dataset Coverage
-      </h2>
-      <p className="text-xs text-slate-500 mb-3">
-        Best practice: test all 3 dataset types before drawing conclusions.
-        Untested = gap in your comparison.
-      </p>
-      <div className="flex gap-3">
-        {DATASETS.map(d => (
-          <div
-            key={d}
-            className={`flex-1 rounded-lg border p-3 text-center ${
-              covered.has(d)
-                ? DATASET_COLORS[d]
-                : 'bg-slate-50 text-slate-400 border-slate-200'
-            }`}
-          >
-            <div className="text-lg">{covered.has(d) ? '✅' : '⬜'}</div>
-            <div className="text-xs font-semibold mt-1">{d}</div>
-            <div className="text-xs mt-0.5">
-              {covered.has(d)
-                ? `${completed.filter(r => r.dataset === d).length} run(s)`
-                : 'not tested'}
-            </div>
-          </div>
-        ))}
-      </div>
-      {covered.size < 3 && (
-        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mt-3">
-          ⚠️ You haven't tested all 3 datasets yet. Compare them before drawing
-          conclusions about your data.
-        </p>
-      )}
-    </div>
-  );
-}
-
-// ── Iteration Status widget ───────────────────────────────────────────────────
-
-type LoopStep = 'define' | 'run' | 'evaluate' | 'decide' | 'next';
-
-function IterationStatus({
-  runs,
-  decisions,
-}: {
-  runs: ExperimentRun[];
-  decisions: Decision[];
-}) {
-  const latest       = runs[0];
-  const latestStatus = latest?.status;
-  const decidedIds   = new Set(
-    decisions.flatMap(d => [d.winner_exp_id, d.loser_exp_id].filter(Boolean))
-  );
-
-  let step: LoopStep = 'define';
-  let message        = 'No experiments yet — define your first one below.';
-
-  if (latest) {
-    if (latestStatus === 'pending') {
-      step    = 'run';
-      message = `${latest.exp_id} is pending. Click Run (on Kaggle) to start training.`;
-    } else if (latestStatus === 'running') {
-      step    = 'evaluate';
-      message = `${latest.exp_id} is training. Wait for it to complete.`;
-    } else if (latestStatus === 'complete' && !decidedIds.has(latest.exp_id)) {
-      step    = 'decide';
-      message = `${latest.exp_id} is done. Record your decision below before creating the next experiment.`;
-    } else {
-      step    = 'next';
-      message = `Last decision recorded. Define the next experiment.`;
-    }
-  }
-
-  const steps: { id: LoopStep; label: string }[] = [
-    { id: 'define',   label: 'Define' },
-    { id: 'run',      label: 'Run' },
-    { id: 'evaluate', label: 'Evaluate' },
-    { id: 'decide',   label: 'Decide' },
-    { id: 'next',     label: 'Next' },
-  ];
-
-  const stepOrder = steps.map(s => s.id);
-  const current   = stepOrder.indexOf(step);
-
-  return (
-    <div className="bg-white rounded-lg border border-slate-200 p-5 mb-6">
-      <h2 className="text-sm font-semibold text-slate-700 uppercase tracking-wider mb-3">
-        Iteration Loop
-      </h2>
-
-      <div className="flex items-center gap-1 mb-4">
-        {steps.map((s, i) => (
-          <div key={s.id} className="flex items-center gap-1">
-            <div
-              className={`px-2.5 py-1 rounded text-xs font-semibold ${
-                i === current
-                  ? 'bg-slate-900 text-white'
-                  : i < current
-                  ? 'bg-green-100 text-green-800 border border-green-300'
-                  : 'bg-slate-100 text-slate-400'
-              }`}
-            >
-              {s.label}
-            </div>
-            {i < steps.length - 1 && (
-              <ChevronRight size={12} className="text-slate-300 flex-shrink-0" />
-            )}
-          </div>
-        ))}
-      </div>
-
-      <p
-        className={`text-sm rounded p-2 ${
-          step === 'decide'
-            ? 'bg-amber-50 border border-amber-200 text-amber-800'
-            : 'bg-slate-50 text-slate-700'
-        }`}
-      >
-        {message}
-      </p>
-    </div>
-  );
-}
-
-// ── Main component ────────────────────────────────────────────────────────────
-
 export default function ExperimentRunner() {
-  const [runs,      setRuns]      = useState<ExperimentRun[]>([]);
+  const [runs, setRuns] = useState<ExperimentRun[]>([]);
   const [decisions, setDecisions] = useState<Decision[]>([]);
-  const [loading,   setLoading]   = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [authed, setAuthed] = useState<boolean | null>(null);
 
-  // New experiment form
-  const [newDataset,     setNewDataset]     = useState<string>('clean');
-  const [newConfig,      setNewConfig]      = useState<string>('baseline');
-  const [newEpochs,      setNewEpochs]      = useState<number>(200);
-  const [newBatchSize,   setNewBatchSize]   = useState<number>(6);
-  const [newChangedFrom, setNewChangedFrom] = useState<string>('');
-  const [newChangeNote,  setNewChangeNote]  = useState<string>('');
-  const [newRvcCommit,   setNewRvcCommit]   = useState<string>('');
+  const [newExpId, setNewExpId] = useState('exp_001');
+  const [newDataset, setNewDataset] = useState('clean');
+  const [newConfig, setNewConfig] = useState('baseline');
+  const [newEpochs, setNewEpochs] = useState(200);
+  const [newBatchSize, setNewBatchSize] = useState(6);
+  const [submitting, setSubmitting] = useState(false);
 
-  // Decision form
-  const [decWinner,   setDecWinner]   = useState('');
-  const [decLoser,    setDecLoser]    = useState('');
-  const [decReason,   setDecReason]   = useState('');
-  const [decNextNote, setDecNextNote] = useState('');
+  const [decWinner, setDecWinner] = useState('');
+  const [decLoser, setDecLoser] = useState('');
+  const [decReason, setDecReason] = useState('');
+  const [decNext, setDecNext] = useState('');
+  const [decRationale, setDecRationale] = useState('');
+  const [decSubmitting, setDecSubmitting] = useState(false);
 
-  const [error,      setError]      = useState('');
+  const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
 
+  // ── Auth check ────────────────────────────────────────────────────────────
   useEffect(() => {
-    loadData();
-    const iv = setInterval(loadData, 30000); // 30s — training runs take hours
-    return () => clearInterval(iv);
+    supabase.auth.getUser().then(({ data }) => {
+      setAuthed(!!data.user);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setAuthed(!!session?.user);
+    });
+    return () => listener.subscription.unsubscribe();
   }, []);
 
-  async function loadData() {
+  // ── Data loading ──────────────────────────────────────────────────────────
+  const loadData = useCallback(async () => {
     try {
-      const [runsRes, decRes] = await Promise.all([
+      const [runsRes, decisionsRes] = await Promise.all([
         supabase.from('experiment_runs').select('*').order('created_at', { ascending: false }),
         supabase.from('decisions').select('*').order('created_at', { ascending: false }),
       ]);
-
       if (runsRes.error) throw runsRes.error;
-      if (decRes.error)  throw decRes.error;
-
+      if (decisionsRes.error) throw decisionsRes.error;
       setRuns(runsRes.data || []);
-      setDecisions(decRes.data || []);
+      setDecisions(decisionsRes.data || []);
     } catch (err) {
       console.error('Failed to load data:', err);
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  // ── Adaptive polling: 10 s when a run is active, 30 s otherwise ──────────
+  useEffect(() => {
+    if (!authed) return;
+    loadData();
+    const getInterval = () =>
+      runs.some((r) => r.status === 'running') ? 10_000 : 30_000;
+    let timer = setInterval(loadData, getInterval());
+    return () => clearInterval(timer);
+  }, [authed, loadData, runs]);
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  function advanceExpId(current: string) {
+    const parts = current.split('_');
+    const num = parseInt(parts[1], 10);
+    // Fix: guard against NaN so auto-increment never produces "exp_NaN"
+    if (!isNaN(num)) {
+      setNewExpId(`exp_${(num + 1).toString().padStart(3, '0')}`);
+    }
   }
 
-  // ── Derive new experiment ID ────────────────────────────────────────────────
-  const derivedExpId = nextExpId(runs);
-  const isFirstExp   = runs.length === 0;
+  function getStatusColor(status: string): string {
+    switch (status) {
+      case 'complete': return 'bg-green-100 text-green-800 border-green-300';
+      case 'running':  return 'bg-blue-100 text-blue-800 border-blue-300';
+      case 'failed':   return 'bg-red-100 text-red-800 border-red-300';
+      default:         return 'bg-gray-100 text-gray-800 border-gray-300';
+    }
+  }
 
-  // ── Check if a decision is required before creating next experiment ─────────
-  const decidedIds     = new Set(
-    decisions.flatMap(d => [d.winner_exp_id, d.loser_exp_id].filter(Boolean))
-  );
-  const latestComplete = runs.find(r => r.status === 'complete');
-  const decisionNeeded =
-    !isFirstExp &&
-    latestComplete &&
-    !decidedIds.has(latestComplete.exp_id);
+  function getCompositeScore(scores?: Record<string, number>): number {
+    if (!scores) return 0;
+    return (
+      (scores.naturalness || 0) * 0.45 +
+      (scores.clarity     || 0) * 0.35 +
+      (scores.identity    || 0) * 0.20
+    );
+  }
 
-  // ── Create experiment ───────────────────────────────────────────────────────
+  // ── Create experiment ─────────────────────────────────────────────────────
   async function createExperiment() {
     setError('');
     setSuccessMsg('');
 
-    if (decisionNeeded) {
-      setError(
-        `Record a decision for ${latestComplete!.exp_id} before creating a new experiment.`
-      );
+    if (!newExpId.match(/^exp_\d+$/)) {
+      setError('Experiment ID must be in the format exp_001, exp_002, etc.');
+      return;
+    }
+    if (runs.some((r) => r.exp_id === newExpId)) {
+      setError(`Experiment ${newExpId} already exists — choose a different ID.`);
       return;
     }
 
-    if (!isFirstExp && !newChangedFrom) {
-      setError('Select which experiment this builds on (Changed From).');
-      return;
-    }
-
-    if (!isFirstExp && !newChangeNote.trim()) {
-      setError('Describe what you changed and why (Change Note).');
-      return;
-    }
-
-    if (runs.some(r => r.exp_id === derivedExpId)) {
-      setError(`Experiment ${derivedExpId} already exists.`);
-      return;
-    }
-
-    // Validate single-change rule
-    if (!isFirstExp && newChangedFrom) {
-      const prevRun = runs.find(r => r.exp_id === newChangedFrom);
-      if (prevRun) {
-        const diffs = (
-          ['dataset', 'config', 'epochs', 'batch_size'] as const
-        ).filter(k => {
-          const prev = (prevRun as Record<string, unknown>)[k];
-          const curr = { dataset: newDataset, config: newConfig, epochs: newEpochs, batch_size: newBatchSize }[k];
-          return prev !== curr;
-        });
-
-        if (diffs.length === 0) {
-          setError(`Identical to ${newChangedFrom}. Change exactly ONE variable.`);
-          return;
-        }
-        if (diffs.length > 1) {
-          setError(
-            `Too many changes (${diffs.join(', ')}). Change exactly ONE variable from ${newChangedFrom}.`
-          );
-          return;
-        }
-      }
-    }
-
+    setSubmitting(true);
     try {
       const { error: insertError } = await supabase.from('experiment_runs').insert({
-        exp_id:          derivedExpId,
-        dataset:         newDataset,
-        config:          newConfig,
-        epochs:          newEpochs,
-        batch_size:      newBatchSize,
-        changed_from:    newChangedFrom || null,
-        change_note:     newChangeNote  || null,
-        rvc_commit:      newRvcCommit   || null,
-        change_variable: (() => {
-          if (!newChangedFrom) return null;
-          const prev = runs.find(r => r.exp_id === newChangedFrom);
-          if (!prev) return null;
-          const kv: Record<string, unknown> = { dataset: newDataset, config: newConfig, epochs: newEpochs, batch_size: newBatchSize };
-          const diffs = (['dataset','config','epochs','batch_size'] as const)
-            .filter(k => (prev as Record<string, unknown>)[k] !== kv[k]);
-          return diffs[0] || null;
-        })(),
-        status:          'pending',
+        exp_id: newExpId,
+        dataset: newDataset,
+        config: newConfig,
+        epochs: newEpochs,
+        batch_size: newBatchSize,
+        status: 'pending',
       });
-
       if (insertError) throw insertError;
-
-      setSuccessMsg(
-        `${derivedExpId} created. Now run it on Kaggle:\n` +
-        `python experiment_runner.py run ${derivedExpId}`
-      );
-      setNewChangedFrom('');
-      setNewChangeNote('');
-      setNewRvcCommit('');
+      setSuccessMsg(`Created ${newExpId}. Run training with: python rdp/main.py --only ${newExpId}`);
+      advanceExpId(newExpId);
       await loadData();
     } catch (err) {
-      setError(`Failed to create: ${err}`);
+      setError(`Failed to create experiment: ${err}`);
+    } finally {
+      setSubmitting(false);
     }
   }
 
-  // ── Record decision ─────────────────────────────────────────────────────────
+  // ── Record decision ───────────────────────────────────────────────────────
   async function recordDecision() {
     setError('');
     setSuccessMsg('');
 
-    if (!decWinner) {
-      setError('Select a winner.');
+    if (!decWinner.trim()) {
+      setError('Winner experiment ID is required.');
       return;
     }
     if (!decReason.trim()) {
-      setError('Reason cannot be empty. What did you learn?');
+      setError('Reason summary is required.');
       return;
     }
 
+    setDecSubmitting(true);
     try {
-      const { error } = await supabase.from('decisions').insert({
-        winner_exp_id:      decWinner,
-        loser_exp_id:       decLoser || null,
-        reason_summary:     decReason,
-        next_planned_exp_id: null,
-        rationale:          decNextNote || null,
+      const { error: insertError } = await supabase.from('decisions').insert({
+        winner_exp_id:        decWinner.trim(),
+        loser_exp_id:         decLoser.trim() || null,
+        reason_summary:       decReason.trim(),
+        next_planned_exp_id:  decNext.trim()  || null,
+        rationale:            decRationale.trim() || null,
       });
-
-      if (error) throw error;
-
-      setSuccessMsg(`Decision recorded. ${decWinner} is the current best.`);
+      if (insertError) throw insertError;
+      setSuccessMsg(`Decision recorded — winner: ${decWinner}`);
       setDecWinner('');
       setDecLoser('');
       setDecReason('');
-      setDecNextNote('');
+      setDecNext('');
+      setDecRationale('');
       await loadData();
     } catch (err) {
       setError(`Failed to record decision: ${err}`);
+    } finally {
+      setDecSubmitting(false);
     }
   }
 
-  // ── Render ──────────────────────────────────────────────────────────────────
-
-  return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 p-6">
-      <div className="max-w-5xl mx-auto">
-
-        {/* Header */}
-        <div className="mb-6">
-          <h1 className="text-3xl font-bold text-slate-900">Experiment Control</h1>
-          <p className="text-slate-500 text-sm mt-1">
-            One variable per experiment · Record every decision · Compare all datasets
+  // ── Not authenticated ─────────────────────────────────────────────────────
+  if (authed === false) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 flex items-center justify-center p-8">
+        <div className="bg-white rounded-lg border border-slate-200 p-10 max-w-sm w-full text-center">
+          <LogIn className="mx-auto mb-4 text-slate-400" size={40} />
+          <h2 className="text-xl font-semibold text-slate-900 mb-2">Sign in required</h2>
+          <p className="text-slate-500 text-sm mb-6">
+            You need to be signed in to view and manage experiments.
           </p>
+          <button
+            onClick={() => supabase.auth.signInWithOAuth({ provider: 'github' })}
+            className="w-full bg-slate-900 hover:bg-slate-800 text-white font-semibold py-2 px-4 rounded-lg transition-colors"
+          >
+            Sign in with GitHub
+          </button>
         </div>
+      </div>
+    );
+  }
 
-        {/* Alerts */}
+  // ── Loading auth state ────────────────────────────────────────────────────
+  if (authed === null) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 flex items-center justify-center">
+        <p className="text-slate-500">Loading...</p>
+      </div>
+    );
+  }
+
+  // ── Main UI ───────────────────────────────────────────────────────────────
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 p-8">
+      <div className="max-w-5xl mx-auto">
+        <h1 className="text-4xl font-bold text-slate-900 mb-2">Experiment Control</h1>
+        <p className="text-slate-600 mb-8">
+          Manual, traceable experiment management. One variable per experiment.
+        </p>
+
         {error && (
-          <div className="mb-5 p-4 bg-red-50 border border-red-200 rounded-lg flex gap-3">
-            <AlertCircle className="text-red-600 flex-shrink-0 mt-0.5" size={18} />
-            <p className="text-red-800 text-sm whitespace-pre-line">{error}</p>
+          <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg flex gap-3">
+            <AlertCircle className="text-red-600 flex-shrink-0 mt-0.5" size={20} />
+            <p className="text-red-800">{error}</p>
           </div>
         )}
         {successMsg && (
-          <div className="mb-5 p-4 bg-green-50 border border-green-200 rounded-lg flex gap-3">
-            <CheckCircle className="text-green-600 flex-shrink-0 mt-0.5" size={18} />
-            <p className="text-green-800 text-sm whitespace-pre-line">{successMsg}</p>
+          <div className="mb-6 p-4 bg-green-50 border border-green-200 rounded-lg flex gap-3">
+            <CheckCircle className="text-green-600 flex-shrink-0 mt-0.5" size={20} />
+            <p className="text-green-800">{successMsg}</p>
           </div>
         )}
 
-        {/* Iteration Status + Dataset Coverage side by side */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-2">
-          <IterationStatus runs={runs} decisions={decisions} />
-          <DatasetCoverage runs={runs} />
-        </div>
-
-        {/* Decision required banner */}
-        {decisionNeeded && (
-          <div className="mb-6 p-4 bg-amber-50 border-2 border-amber-400 rounded-lg">
-            <p className="font-semibold text-amber-900">
-              🛑 Decision required before creating next experiment
-            </p>
-            <p className="text-sm text-amber-800 mt-1">
-              {latestComplete!.exp_id} finished. Scroll down to record your
-              decision — which model won and why — then come back here.
-            </p>
-          </div>
-        )}
-
-        {/* ── Create Experiment ─────────────────────────────────────────────── */}
-        <div className="bg-white rounded-lg border border-slate-200 p-6 mb-6">
-          <div className="flex justify-between items-center mb-4">
-            <h2 className="text-lg font-semibold text-slate-900">
-              Define Experiment{' '}
-              <span className="font-mono text-slate-500 text-sm">{derivedExpId}</span>
-            </h2>
-            {decisionNeeded && (
-              <span className="text-xs font-semibold text-red-700 bg-red-50 border border-red-200 px-2 py-1 rounded">
-                Blocked — record decision first
-              </span>
-            )}
-          </div>
-
+        {/* ── Define experiment ── */}
+        <div className="bg-white rounded-lg border border-slate-200 p-6 mb-8">
+          <h2 className="text-xl font-semibold text-slate-900 mb-4">Define New Experiment</h2>
           <div className="grid grid-cols-2 gap-4 mb-4">
             <div>
-              <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wider">
-                Dataset
-              </label>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Experiment ID</label>
+              <input
+                type="text"
+                value={newExpId}
+                onChange={(e) => setNewExpId(e.target.value)}
+                placeholder="exp_001"
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-400"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Dataset</label>
               <select
                 value={newDataset}
-                onChange={e => setNewDataset(e.target.value)}
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900"
+                onChange={(e) => setNewDataset(e.target.value)}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-slate-900"
               >
-                {DATASETS.map(d => (
-                  <option key={d} value={d}>{d}</option>
-                ))}
+                <option value="clean">clean</option>
+                <option value="natural">natural</option>
+                <option value="raw">raw</option>
               </select>
             </div>
-
             <div>
-              <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wider">
-                Config
-              </label>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Config</label>
               <select
                 value={newConfig}
-                onChange={e => setNewConfig(e.target.value)}
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900"
+                onChange={(e) => setNewConfig(e.target.value)}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-slate-900"
               >
-                {CONFIGS.map(c => (
-                  <option key={c} value={c}>{c}</option>
-                ))}
+                <option value="baseline">baseline</option>
+                <option value="high_quality">high_quality</option>
               </select>
             </div>
-
             <div>
-              <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wider">
-                Epochs
-              </label>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Epochs</label>
               <input
                 type="number"
                 value={newEpochs}
-                onChange={e => setNewEpochs(parseInt(e.target.value) || 200)}
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900"
+                onChange={(e) => setNewEpochs(parseInt(e.target.value, 10))}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-slate-900"
               />
             </div>
-
             <div>
-              <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wider">
-                Batch Size
-              </label>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Batch Size</label>
               <input
                 type="number"
                 value={newBatchSize}
-                onChange={e => setNewBatchSize(parseInt(e.target.value) || 6)}
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900"
+                onChange={(e) => setNewBatchSize(parseInt(e.target.value, 10))}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-slate-900"
               />
-            </div>
-
-            <div className="col-span-2">
-              <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wider">
-                RVC Commit{' '}
-                <span className="font-normal text-slate-400 normal-case tracking-normal">
-                  (optional — auto-detected at run time if blank)
-                </span>
-              </label>
-              <input
-                type="text"
-                value={newRvcCommit}
-                onChange={e => setNewRvcCommit(e.target.value)}
-                placeholder="e.g. abc123def456  →  run: git -C /path/to/rvc rev-parse HEAD"
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900 font-mono"
-              />
-              <p className="text-xs text-slate-400 mt-1">
-                Ensures exp_001 and exp_003 are on the same RVC version — if the repo
-                updates between runs, scores aren't comparable.
-              </p>
             </div>
           </div>
-
-          {/* Changed From — only shown for exp_002+ */}
-          {!isFirstExp && (
-            <div className="mt-2 pt-4 border-t border-slate-100 grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wider">
-                  Changed From <span className="text-red-500">*</span>
-                </label>
-                <select
-                  value={newChangedFrom}
-                  onChange={e => setNewChangedFrom(e.target.value)}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900"
-                >
-                  <option value="">— select parent experiment —</option>
-                  {runs.map(r => (
-                    <option key={r.exp_id} value={r.exp_id}>
-                      {r.exp_id} ({r.dataset}, {r.config}, {r.epochs}e)
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wider">
-                  Change Note <span className="text-red-500">*</span>
-                </label>
-                <input
-                  type="text"
-                  value={newChangeNote}
-                  onChange={e => setNewChangeNote(e.target.value)}
-                  placeholder="e.g. testing natural dataset instead of clean"
-                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900"
-                />
-              </div>
-
-              {/* Show what will change */}
-              {newChangedFrom && (() => {
-                const prev = runs.find(r => r.exp_id === newChangedFrom);
-                if (!prev) return null;
-                const kv: Record<string, unknown> = { dataset: newDataset, config: newConfig, epochs: newEpochs, batch_size: newBatchSize };
-                const diffs = (['dataset','config','epochs','batch_size'] as const)
-                  .filter(k => (prev as Record<string, unknown>)[k] !== kv[k])
-                  .map(k => `${k}: ${(prev as Record<string,unknown>)[k]} → ${kv[k]}`);
-
-                return (
-                  <div className="col-span-2">
-                    <div className={`text-xs rounded p-2 ${
-                      diffs.length === 1
-                        ? 'bg-green-50 border border-green-200 text-green-800'
-                        : diffs.length === 0
-                        ? 'bg-amber-50 border border-amber-200 text-amber-800'
-                        : 'bg-red-50 border border-red-200 text-red-800'
-                    }`}>
-                      {diffs.length === 1
-                        ? `✅ Single change: ${diffs[0]}`
-                        : diffs.length === 0
-                        ? '⚠️ No changes from parent — change exactly one variable'
-                        : `❌ ${diffs.length} changes detected: ${diffs.join(', ')} — change only ONE`}
-                    </div>
-                  </div>
-                );
-              })()}
-            </div>
-          )}
-
           <button
             onClick={createExperiment}
-            disabled={!!decisionNeeded}
-            className={`mt-4 w-full font-semibold py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 transition-colors ${
-              decisionNeeded
-                ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
-                : 'bg-slate-900 hover:bg-slate-800 text-white'
-            }`}
+            disabled={submitting}
+            className="w-full bg-slate-900 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-2 px-4 rounded-lg flex items-center justify-center gap-2 transition-colors"
           >
-            <Play size={15} />
-            Create {derivedExpId}
+            {submitting ? (
+              <span className="animate-spin inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full" />
+            ) : (
+              <Play size={16} />
+            )}
+            {submitting ? 'Creating…' : 'Create Experiment'}
           </button>
+          <p className="mt-2 text-xs text-slate-400 text-center">
+            After creating, start training: <code className="bg-slate-100 px-1 rounded">python rdp/main.py --only {newExpId}</code>
+          </p>
         </div>
 
-        {/* ── Experiment Runs Table ─────────────────────────────────────────── */}
-        <div className="bg-white rounded-lg border border-slate-200 p-6 mb-6">
-          <h2 className="text-lg font-semibold text-slate-900 mb-4 flex items-center gap-2">
-            <TrendingUp size={18} />
+        {/* ── Experiment runs ── */}
+        <div className="bg-white rounded-lg border border-slate-200 p-6 mb-8">
+          <h2 className="text-xl font-semibold text-slate-900 mb-4 flex items-center gap-2">
+            <TrendingUp size={20} />
             Experiment Runs
           </h2>
-
           {loading ? (
-            <p className="text-slate-500 text-sm">Loading…</p>
+            <p className="text-slate-500">Loading…</p>
           ) : runs.length === 0 ? (
-            <p className="text-slate-500 text-sm">No experiments yet.</p>
+            <p className="text-slate-500">No experiments yet.</p>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead className="bg-slate-50 border-b border-slate-200">
                   <tr>
-                    <th className="px-3 py-2 text-left font-semibold text-slate-700">ID</th>
-                    <th className="px-3 py-2 text-left font-semibold text-slate-700">Dataset</th>
-                    <th className="px-3 py-2 text-left font-semibold text-slate-700">Config</th>
-                    <th className="px-3 py-2 text-left font-semibold text-slate-700">Params</th>
-                    <th className="px-3 py-2 text-left font-semibold text-slate-700">Changed from</th>
-                    <th className="px-3 py-2 text-left font-semibold text-slate-700">Status</th>
-                    <th className="px-3 py-2 text-right font-semibold text-slate-700">Score</th>
+                    <th className="px-4 py-2 text-left font-semibold text-slate-900">ID</th>
+                    <th className="px-4 py-2 text-left font-semibold text-slate-900">Dataset</th>
+                    <th className="px-4 py-2 text-left font-semibold text-slate-900">Config</th>
+                    <th className="px-4 py-2 text-left font-semibold text-slate-900">Params</th>
+                    <th className="px-4 py-2 text-left font-semibold text-slate-900">Status</th>
+                    <th className="px-4 py-2 text-right font-semibold text-slate-900">Natural</th>
+                    <th className="px-4 py-2 text-right font-semibold text-slate-900">Clarity</th>
+                    <th className="px-4 py-2 text-right font-semibold text-slate-900">Identity</th>
+                    <th className="px-4 py-2 text-right font-semibold text-slate-900">Composite</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {runs.map(run => {
-                    const composite = getCompositeScore(run.scores);
-                    const isWinner  = decisions.some(d => d.winner_exp_id === run.exp_id);
-                    return (
-                      <tr key={run.id} className="border-b border-slate-100 hover:bg-slate-50">
-                        <td className="px-3 py-2 font-mono font-semibold text-slate-900">
-                          {run.exp_id}
-                          {isWinner && <Star size={11} className="inline ml-1 text-amber-500" fill="currentColor" />}
-                        </td>
-                        <td className="px-3 py-2">
-                          <span className={`px-2 py-0.5 text-xs font-semibold rounded border ${DATASET_COLORS[run.dataset] || ''}`}>
-                            {run.dataset}
-                          </span>
-                        </td>
-                        <td className="px-3 py-2 text-slate-600 text-xs">{run.config}</td>
-                        <td className="px-3 py-2 text-xs text-slate-500">
-                          <div>{run.epochs}e · b{run.batch_size}</div>
-                          {run.rvc_commit && (
-                            <div className="font-mono text-slate-300 text-[10px] mt-0.5" title="RVC repo commit">
-                              {run.rvc_commit.slice(0, 8)}
-                            </div>
-                          )}
-                        </td>
-                        <td className="px-3 py-2 text-xs text-slate-500">
-                          {run.changed_from ? (
-                            <span>
-                              <span className="font-mono">{run.changed_from}</span>
-                              {run.change_variable && (
-                                <span className="ml-1 text-slate-400">[{run.change_variable}]</span>
-                              )}
-                              {run.change_note && (
-                                <div className="text-slate-400 truncate max-w-[140px]" title={run.change_note}>
-                                  {run.change_note}
-                                </div>
-                              )}
-                            </span>
-                          ) : (
-                            <span className="text-slate-300">baseline</span>
-                          )}
-                        </td>
-                        <td className="px-3 py-2">
-                          <span className={`px-2 py-0.5 text-xs font-semibold rounded border ${getStatusBadge(run.status)}`}>
-                            {run.status}
-                          </span>
-                        </td>
-                        <td className="px-3 py-2 text-right">
-                          {composite !== null && run.status === 'complete' ? (
-                            <div>
-                              <div className="font-bold text-slate-900">{composite.toFixed(3)}</div>
-                              {run.scores?.identity !== undefined && (
-                                <div
-                                  className="text-[10px] text-slate-400 mt-0.5"
-                                  title="Pitch correlation (F0 similarity) — real identity metric"
-                                >
-                                  pitch {run.scores.identity.toFixed(2)}
-                                </div>
-                              )}
-                            </div>
-                          ) : (
-                            <span className="text-slate-400">—</span>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
+                  {runs.map((run) => (
+                    <tr key={run.id} className="border-b border-slate-100 hover:bg-slate-50">
+                      <td className="px-4 py-2 font-mono text-slate-900">{run.exp_id}</td>
+                      <td className="px-4 py-2 text-slate-600">{run.dataset}</td>
+                      <td className="px-4 py-2 text-slate-600">{run.config}</td>
+                      <td className="px-4 py-2 text-xs text-slate-600">{run.epochs}e, b{run.batch_size}</td>
+                      <td className="px-4 py-2">
+                        <span className={`px-2 py-1 text-xs font-semibold rounded border ${getStatusColor(run.status)}`}>
+                          {run.status}
+                        </span>
+                      </td>
+                      {/* Individual scores — only shown when complete */}
+                      <td className="px-4 py-2 text-right text-slate-700">
+                        {run.scores && run.status === 'complete'
+                          ? (run.scores.naturalness ?? 0).toFixed(3) : '—'}
+                      </td>
+                      <td className="px-4 py-2 text-right text-slate-700">
+                        {run.scores && run.status === 'complete'
+                          ? (run.scores.clarity ?? 0).toFixed(3) : '—'}
+                      </td>
+                      <td className="px-4 py-2 text-right text-slate-700">
+                        {run.scores && run.status === 'complete'
+                          ? (run.scores.identity ?? 0).toFixed(3) : '—'}
+                      </td>
+                      <td className="px-4 py-2 text-right font-bold text-slate-900">
+                        {run.scores && run.status === 'complete'
+                          ? getCompositeScore(run.scores).toFixed(3) : '—'}
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
           )}
         </div>
 
-        {/* ── Record Decision ───────────────────────────────────────────────── */}
-        <div className={`bg-white rounded-lg border p-6 mb-6 ${
-          decisionNeeded ? 'border-amber-400 ring-2 ring-amber-200' : 'border-slate-200'
-        }`}>
-          <h2 className="text-lg font-semibold text-slate-900 mb-1 flex items-center gap-2">
-            <BookOpen size={18} />
+        {/* ── Record decision ── */}
+        <div className="bg-white rounded-lg border border-slate-200 p-6 mb-8">
+          <h2 className="text-xl font-semibold text-slate-900 mb-1 flex items-center gap-2">
+            <Trophy size={20} />
             Record Decision
-            {decisionNeeded && (
-              <span className="text-xs font-bold text-amber-700 bg-amber-100 border border-amber-300 px-2 py-0.5 rounded ml-1">
-                REQUIRED NOW
-              </span>
-            )}
           </h2>
-          <p className="text-xs text-slate-500 mb-4">
-            After comparing two experiments, record which one won and why.
-            This is REQUIRED before creating the next experiment.
+          <p className="text-sm text-slate-500 mb-4">
+            After listening to experiments, record which one won and why. This is your iteration memory.
           </p>
-
-          <div className="grid grid-cols-2 gap-4 mb-3">
+          <div className="grid grid-cols-2 gap-4 mb-4">
             <div>
-              <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wider">
+              <label className="block text-sm font-medium text-slate-700 mb-1">
                 Winner <span className="text-red-500">*</span>
               </label>
-              <select
+              <input
+                type="text"
                 value={decWinner}
-                onChange={e => setDecWinner(e.target.value)}
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900"
-              >
-                <option value="">— select winner —</option>
-                {runs.filter(r => r.status === 'complete').map(r => (
-                  <option key={r.exp_id} value={r.exp_id}>
-                    {r.exp_id} ({r.dataset}, {getCompositeScore(r.scores)?.toFixed(3) ?? '?'})
-                  </option>
-                ))}
-              </select>
+                onChange={(e) => setDecWinner(e.target.value)}
+                placeholder="exp_002"
+                list="exp-ids"
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-400"
+              />
             </div>
-
             <div>
-              <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wider">
-                Loser (optional)
-              </label>
-              <select
+              <label className="block text-sm font-medium text-slate-700 mb-1">Loser (optional)</label>
+              <input
+                type="text"
                 value={decLoser}
-                onChange={e => setDecLoser(e.target.value)}
-                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900"
-              >
-                <option value="">— none —</option>
-                {runs.filter(r => r.status === 'complete' && r.exp_id !== decWinner).map(r => (
-                  <option key={r.exp_id} value={r.exp_id}>
-                    {r.exp_id} ({r.dataset})
-                  </option>
-                ))}
-              </select>
+                onChange={(e) => setDecLoser(e.target.value)}
+                placeholder="exp_001"
+                list="exp-ids"
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-400"
+              />
+            </div>
+            <div className="col-span-2">
+              <label className="block text-sm font-medium text-slate-700 mb-1">
+                Reason <span className="text-red-500">*</span>
+              </label>
+              <input
+                type="text"
+                value={decReason}
+                onChange={(e) => setDecReason(e.target.value)}
+                placeholder="e.g. Natural dataset sounded more authentic, less robotic"
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-400"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Next planned experiment</label>
+              <input
+                type="text"
+                value={decNext}
+                onChange={(e) => setDecNext(e.target.value)}
+                placeholder="exp_003"
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-400"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Rationale for next step</label>
+              <input
+                type="text"
+                value={decRationale}
+                onChange={(e) => setDecRationale(e.target.value)}
+                placeholder="e.g. Try high_quality config with natural dataset"
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-400"
+              />
             </div>
           </div>
-
-          <div className="mb-3">
-            <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wider">
-              Reason — what did you learn? <span className="text-red-500">*</span>
-            </label>
-            <textarea
-              value={decReason}
-              onChange={e => setDecReason(e.target.value)}
-              placeholder="e.g. Natural dataset produced more human-sounding output on test_1. Clean mode over-compressed the voice."
-              rows={2}
-              className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900 resize-none"
-            />
-          </div>
-
-          <div className="mb-4">
-            <label className="block text-xs font-semibold text-slate-600 mb-1 uppercase tracking-wider">
-              Next experiment rationale (optional)
-            </label>
-            <input
-              type="text"
-              value={decNextNote}
-              onChange={e => setDecNextNote(e.target.value)}
-              placeholder="e.g. Will try high_quality config with natural dataset next"
-              className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900"
-            />
-          </div>
-
           <button
             onClick={recordDecision}
-            className="w-full bg-slate-900 hover:bg-slate-800 text-white font-semibold py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 transition-colors"
+            disabled={decSubmitting}
+            className="w-full bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-2 px-4 rounded-lg flex items-center justify-center gap-2 transition-colors"
           >
-            <CheckCircle size={15} />
-            Record Decision
+            {decSubmitting ? (
+              <span className="animate-spin inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full" />
+            ) : (
+              <CheckCircle size={16} />
+            )}
+            {decSubmitting ? 'Saving…' : 'Record Decision'}
           </button>
+          {/* Datalist for autocomplete */}
+          <datalist id="exp-ids">
+            {runs.map((r) => <option key={r.id} value={r.exp_id} />)}
+          </datalist>
         </div>
 
-        {/* ── Decision Log ──────────────────────────────────────────────────── */}
+        {/* ── Decision log ── */}
         <div className="bg-white rounded-lg border border-slate-200 p-6">
-          <h2 className="text-lg font-semibold text-slate-900 mb-4 flex items-center gap-2">
-            <Info size={18} />
-            Decision Log
-          </h2>
-
-          {decisions.length === 0 ? (
-            <p className="text-slate-500 text-sm">
-              No decisions yet. Compare experiments and record winners above.
-            </p>
+          <h2 className="text-xl font-semibold text-slate-900 mb-4">Decision Log</h2>
+          {loading ? (
+            <p className="text-slate-500">Loading…</p>
+          ) : decisions.length === 0 ? (
+            <p className="text-slate-500">No decisions recorded yet. Compare experiments above and record the winner.</p>
           ) : (
             <div className="space-y-3">
-              {decisions.map(d => (
-                <div key={d.id} className="p-3 bg-slate-50 rounded border border-slate-200">
+              {decisions.map((decision) => (
+                <div key={decision.id} className="p-3 bg-slate-50 rounded border border-slate-200">
                   <div className="flex justify-between items-start mb-1">
-                    <span className="text-sm font-semibold text-slate-900">
-                      <Star size={12} className="inline text-amber-500 mr-1" fill="currentColor" />
-                      {d.winner_exp_id}
-                      {d.loser_exp_id && (
-                        <span className="font-normal text-slate-500"> beat {d.loser_exp_id}</span>
+                    <span className="font-semibold text-slate-900">
+                      Winner: <span className="font-mono text-emerald-700">{decision.winner_exp_id}</span>
+                      {decision.loser_exp_id && (
+                        <span className="text-slate-400 font-normal"> vs <span className="font-mono">{decision.loser_exp_id}</span></span>
                       )}
                     </span>
-                    <span className="text-xs text-slate-400">
-                      {new Date(d.created_at).toLocaleDateString()}
+                    <span className="text-xs text-slate-400 whitespace-nowrap ml-4">
+                      {new Date(decision.created_at).toLocaleDateString()}
                     </span>
                   </div>
-                  <p className="text-sm text-slate-700">{d.reason_summary}</p>
-                  {d.rationale && (
-                    <p className="text-xs text-slate-500 mt-1 italic">Next: {d.rationale}</p>
+                  <p className="text-sm text-slate-700 mb-1">{decision.reason_summary}</p>
+                  {decision.next_planned_exp_id && (
+                    <p className="text-xs text-slate-500">
+                      Next: <span className="font-mono">{decision.next_planned_exp_id}</span>
+                      {decision.rationale && <> — {decision.rationale}</>}
+                    </p>
                   )}
                 </div>
               ))}
             </div>
           )}
         </div>
-
       </div>
     </div>
   );
